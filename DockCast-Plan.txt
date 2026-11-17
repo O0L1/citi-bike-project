@@ -1,0 +1,203 @@
+# DockCast: Will There Be a Bike? (NYC Citi Bike Data Engineering Project Plan)
+Prepared 2026-11-17 for Olivier. Data sources checked live on 2026-11-17 (America/Toronto). Status: selected, planning.
+
+## Summary
+DockCast is a live, self-scoring data pipeline built on NYC's bike-share data. It does three jobs:
+1. Every 10 minutes it saves a snapshot of the live station feed (2,519 stations).
+2. Every month it loads the official trip files (5.09M trips in Oct 2026).
+3. It joins in weather and holidays, models everything in dbt with tests, and each hour predicts which stations will have **no bikes in 60 minutes**.
+
+Each prediction is checked against what actually happened. The model is scored against three simple baselines (persistence, station climatology, and same time last week), and the scores are logged permanently and shown on a public dashboard.
+
+It follows the same pattern as Sarthak Mahale's ecommerce-pipeline (ingest -> bronze -> dbt silver/gold -> tests -> orchestration -> dashboard -> run log), but with real data, a live feed, and a forecasting layer that keeps scoring itself. Medium difficulty, about 43 hours.
+
+Disclaimer to put in the README: "Independent project using public Citi Bike system data. Not affiliated with or endorsed by Lyft/Citi Bike." (Required by the data licence; avoid putting "Citi Bike" or its logo in the project name.)
+
+## 1. Verified data sources
+
+| Source | Exact endpoint | Format / cadence | History / size (verified) | Key fields | Terms / limits |
+|---|---|---|---|---|---|
+| Citi Bike trip history | Bucket index https://s3.amazonaws.com/tripdata/ ; monthly e.g. https://s3.amazonaws.com/tripdata/202610-citibike-tripdata.zip ; JC e.g. https://s3.amazonaws.com/tripdata/JC-202610-citibike-tripdata.zip | Zipped CSV. Monthly files for 2024-01 onward; yearly zips for 2013–2023. New month posted ~4th–12th of the next month (Oct 2026 posted 2026-11-05) | 180 objects, 2013 to 2026-10. Oct 2026: 5,088,365 trips, 315 MB zip / 1.0 GB CSV split into 4 parts (~252 MB each). Monthly zips in 2025: 396 MB–1,032 MB. JC Oct 2026: 111,446 trips. Jul 2013: 843,416 trips | ride_id, rideable_type, started_at, ended_at, start/end_station_name, start/end_station_id, start/end lat/lng, member_casual | No auth. Citi Bike Data License (https://citibikenyc.com/data-sharing-policy): free for any lawful use, but you can't republish the data as a stand-alone dataset or imply affiliation/use its marks |
+| Citi Bike live GBFS | Discovery https://gbfs.citibikenyc.com/gbfs/2.3/gbfs.json -> https://gbfs.lyft.com/gbfs/2.3/bkn/en/station_status.json , .../station_information.json , .../system_information.json | JSON, ttl 60 s (updates every minute) | Live only, so you build your own history. 2,519 stations. station_status ~1.08 MB per call; ~50 KB per snapshot as zstd Parquet (slim columns) | status: station_id (UUID), num_bikes_available, num_ebikes_available, num_docks_available, num_bikes_disabled, is_installed, is_renting, is_returning, last_reported. info: station_id, short_name (e.g. 6560.01, matches trip start_station_id), name, lat, lon, capacity, region_id | No auth. Same licence. system timezone America/New_York |
+| Weather (hourly) | Open-Meteo archive: https://archive-api.open-meteo.com/v1/archive?latitude=40.7789&longitude=-73.9692&start_date=...&end_date=...&hourly=temperature_2m,precipitation,snowfall,wind_speed_10m,weather_code&timezone=America%2FNew_York ; live forecast: https://api.open-meteo.com/v1/forecast?...&forecast_days=2 | JSON. Archive lags ~2 days (latest = 2026-11-15 when checked on 11-17) | Back to 1940 (per Open-Meteo docs, not re-checked). Snaps to a grid cell (request returned 40.808, -74.020) | time, temperature_2m, precipitation, snowfall, wind_speed_10m, weather_code | Free non-commercial: <10k calls/day, 5k/hour, 600/min; CC BY 4.0 (https://open-meteo.com/en/terms) |
+| Weather (daily, official) | NOAA NCEI: https://www.ncei.noaa.gov/access/services/data/v1?dataset=daily-summaries&stations=USW00094728&startDate=2026-11-01&endDate=2026-11-17&dataTypes=TMAX,TMIN,PRCP,SNOW,AWND&units=metric&format=csv | CSV, ~1-week lag (latest 2026-11-10 when checked on 11-17) | Central Park station USW00094728 | DATE, TMAX, TMIN, PRCP, SNOW, AWND | No token for this endpoint; US-government public data |
+| US holidays | https://date.nager.at/api/v3/PublicHolidays/2026/US | JSON, yearly | Any year | date, name, types | Free, no auth |
+| NYC DOT bike & pedestrian counters (validation/feature) | https://data.cityofnewyork.us/resource/ct66-47at.json (Socrata SoQL) | 15-min counts, updated daily (latest 2026-11-17 05:00) | 2012-08-31 to now; 21.6M rows; 41 sensors; 20.05M bike rows | sensor_id, travelmode, direction, flowname, timestamp, granularity, counts, status | Optional free app token raises the throttle limit |
+| MTA subway hourly ridership (alt angle) | 2025+: https://data.ny.gov/resource/5wq4-mkjj.json ; 2020–24: wujg-7c2s ; 2017–19: t69i-h2me | Hourly by station complex. Lags ~12 days (latest 2026-11-05 23:00) | Very large, so query aggregated with SoQL | transit_timestamp, station_complex_id, station_complex, borough, payment_method, fare_class_category, ridership, transfers, latitude, longitude | data.ny.gov Socrata |
+| Motor Vehicle Collisions (alt angle) | https://data.cityofnewyork.us/resource/h9gi-nx95.json | Daily-ish (latest crash_date 2026-11-14) | 159,015 crashes since 2025-01-01 | crash_date, crash_time, borough, lat/lon, number_of_cyclist_injured/killed, contributing_factor_vehicle_1 | NYC Open Data |
+
+Considered and dropped: 311 (erm2-nwe9) is too noisy for this project. Special Events Permits (dm95-f8w5) was last updated Jan 2025, so it's stale. NYPD complaints aren't relevant.
+
+A useful real data point: on 2026-10-11, Central Park recorded 46.7 mm of rain (NCEI) and Citi Bike logged 38,617 trips, against about 150k–200k on surrounding days. That's the case for the weather join, in one line.
+
+## 2. Recommended project: DockCast
+
+### Architecture (mermaid)
+```mermaid
+flowchart LR
+  subgraph Sources
+    G[GBFS station_status<br/>every 10 min]
+    I[GBFS station_information<br/>daily]
+    T[S3 tripdata zips<br/>monthly]
+    W[Open-Meteo archive + forecast<br/>hourly]
+    H[Nager.Date holidays]
+  end
+  subgraph Orchestration[GitHub Actions cron]
+    J1[snapshot job */10]
+    J2[daily job 06:17 ET]
+    J3[monthly job day 6-12]
+  end
+  G --> J1
+  I --> J2
+  W --> J2
+  H --> J2
+  T --> J3
+  J1 --> B[(Bronze<br/>Parquet / MotherDuck raw_*)]
+  J2 --> B
+  J3 --> B
+  B --> D[dbt-duckdb<br/>silver stg_* / dim_station]
+  D --> GLD[gold fct_* + feat_*]
+  GLD --> M[Forecast job<br/>baselines + LightGBM]
+  M --> F[(forecasts)]
+  F --> S[Scoring job<br/>forecast_scores]
+  GLD --> DB[Streamlit / Evidence dashboard]
+  S --> DB
+  J1 --> L[(pipeline_runs log<br/>+ anomaly checks)]
+  J2 --> L
+  L --> DB
+```
+
+### Storage
+- **Default: MotherDuck Lite (free).** 10 GB storage, 10 hours of compute a month, and up to 2 service accounts (https://motherduck.com/product/pricing/). It's DuckDB in the cloud, so the same SQL runs locally and in CI, and dbt-duckdb supports it.
+- **Fallback: plain Parquet files.** Keep them in a private bucket or on the runner, partitioned `dt=YYYY-MM-DD/`, and query them with local DuckDB. Don't commit raw data to a public repo, because the licence bans redistributing it as a stand-alone dataset.
+- **Sizing.** Keep about 12–24 months of trips, not all of history. One year of trips is ~60M rows, roughly 2–3 GB as Parquet (estimate). Snapshots at 10-minute cadence run ~362k rows/day, ~11M rows/month, ~220 MB/month as Parquet (estimate from the 50 KB snapshot measured above).
+
+### Orchestration
+Use GitHub Actions in a public repo; standard runners are free for public repos. Rules from the GitHub docs:
+- The shortest cron interval is 5 minutes.
+- Runs can be delayed or dropped at busy times like the top of the hour, so schedule at odd minutes.
+- Scheduled workflows auto-disable after 60 days without repo activity.
+
+You need a "gap monitor" either way. Three workflows:
+- `snapshot.yml` (every 10 min, at minutes like 3,13,23,...)
+- `daily.yml` (06:17 ET: refresh station_information, weather, and holidays, run `dbt build`, then train or forecast, then score)
+- `monthly.yml` (daily from the 4th to the 14th of each month; it checks the S3 index for a new month's file and loads it if found)
+
+Stretch goal: run the same DAG locally in Airflow (Docker) or Dagster for the "Airflow" keyword. Don't host Airflow 24/7; it isn't free and it isn't needed.
+
+### Layers and tables (grain)
+**Bronze** (append-only, as delivered, plus `_source_file`, `_ingested_at`, `_run_id`):
+- `raw_trips`: 1 row per trip per source file
+- `raw_station_status`: 1 row per station per snapshot (`snapshot_ts` = feed last_updated, UTC epoch)
+- `raw_station_information`: 1 row per station per daily pull
+- `raw_weather_hourly`: 1 row per hour per pull
+- `raw_holidays`: 1 row per holiday
+
+**Silver** (dbt staging, typed, deduped, harmonized):
+- `stg_trips`: 1 row per ride_id. Legacy (pre-Feb 2021) and modern schemas are unioned into one; ride_id is cast to VARCHAR; times are localized to America/New_York and converted to UTC.
+- `stg_station_status`: 1 row per station_id and last_reported. Filter out is_installed=0 and placeholder last_reported values (e.g. 86400).
+- `dim_station`: SCD type 2 keyed on short_name, with name, lat/lon, capacity, and valid_from/valid_to. It maps the GBFS UUID to short_name to the trip station_id.
+- `stg_weather_hourly`: 1 row per local hour
+- `dim_date_hour`: 1 row per hour, with hour-of-week, holiday flag, and DST flag
+
+**Gold** (marts):
+- `fct_station_hour_flows`: station × hour, with departures, arrivals, net_flow, and e-bike share (from trips; ~1.78M rows/month on a full grid)
+- `fct_station_status_hourly`: station × hour, with min/avg bikes, minutes_empty, minutes_full, and snapshot_count
+- `fct_system_daily`: day, with trips, member share, e-bike share, temp, and precip
+- `feat_empty_risk`: station × issue_hour, holding the features available at issue time and the label (empty at +60 min)
+- `forecasts`: forecast_id, model, station_id, issued_at, target_ts, p_empty (append-only)
+- `forecast_scores`: model × day (and × borough), with n, Brier, log loss, Brier skill vs climatology, and hit rate at p>0.5
+- `pipeline_runs`: run_id, job, started_at, ended_at, status, rows_in, rows_out, freshness_minutes, anomaly_flags
+
+### Example dbt tests (aim for 30+)
+- `unique` and `not_null` on `stg_trips.ride_id`; `not_null` on started_at and ended_at
+- `accepted_values`: rideable_type in {classic_bike, electric_bike, docked_bike}; member_casual in {member, casual}
+- Custom: ended_at >= started_at, and trip duration < 24 h. Make the duration check warn rather than fail, since Oct 2026 had 923 trips over 1 day.
+- `relationships`: stg_trips.start_station_id -> dim_station.short_name (warn; 2,356 of 2,370 Oct-2026 start IDs matched current GBFS short_names)
+- Range checks: `num_bikes_available + num_docks_available <= capacity + tolerance`; lat between 40.4 and 41.0; lon between -74.3 and -73.6
+- Uniqueness of the combination (station_id, hour) in every gold station-hour model
+- Source freshness: raw_station_status max snapshot_ts within 30 min (warn) or 90 min (error)
+- Anomaly: daily trip count within ±4 robust z-scores of the trailing 28 same-weekdays (a custom generic test or an Elementary/dbt-expectations package)
+- Forecast integrity: p_empty between 0 and 1; every forecast older than 2 h has a matching score row
+
+### Forecasting layer: "Will this station be empty in 60 minutes?"
+- **Target:** `y = 1` if, at the snapshot nearest issue_time + 60 min, the station has `num_bikes_available = 0` while installed and renting. A variant predicts "full" (no docks).
+- **Issue cadence:** hourly. Start with the ~300 busiest stations to keep compute in the free tier, then scale up.
+- **Baselines:**
+  1. Persistence: p = 1 if empty now, else 0, with smoothing.
+  2. Climatology: the station × hour-of-week empty rate over the trailing 4 weeks.
+  3. Seasonal naive: empty status at the same time last week.
+- **Models:** logistic regression, then LightGBM. Features: current bikes and e-bikes, fill ratio, change over the last 30 and 60 min, capacity, hour-of-week, holiday, forecast temp and precip, and the station's historical departures/arrivals for that hour-of-week (from trips).
+- **Validation:** walk-forward backtest (train on weeks 1..k, test on week k+1), then live scoring.
+- **Metrics:** Brier score, log loss, Brier skill score vs climatology, reliability diagram, and PR-AUC (the classes are imbalanced: 251 of 2,519 stations were empty at 13:37 ET on 2026-11-17).
+- **Secondary forecast:** next 1–7 days of system-wide trips from `fct_system_daily` plus the weather forecast, scored by MAE/MAPE against seasonal naive (same weekday last week).
+- **Cold start:** snapshot history only exists from the day the snapshotter starts, so start M3 in week 1. The empty-station model needs about 3–4 weeks of snapshots before the backtest means anything. Meanwhile, build the trip-based demand features.
+
+### Monitoring
+- Every job writes a `pipeline_runs` row.
+- A daily check flags: snapshot gaps over 30 min, a row count outside the expected band (~2,500 stations per snapshot), the share of stations reporting dropping, a weather pull that came back empty, and dbt test failures.
+- Failures surface through GitHub Actions emails (built in) and a "Pipeline health" tab on the dashboard. Optionally add a README badge.
+
+### Dashboard
+**Streamlit** on Streamlit Community Cloud (free hosting, reading from MotherDuck; free-tier limits not re-checked). Alternative: Evidence.dev (SQL + markdown, static, deployable for free on GitHub Pages or Netlify; not re-checked). Tabs:
+1. Live map of empty-risk
+2. Model vs baselines: rolling 7-day Brier and log loss, plus a reliability plot
+3. Demand explorer (hour-of-week heatmap, weather effect)
+4. Pipeline health
+
+### CI / code quality
+On every PR:
+- `ruff` + `pytest` (unit tests for parsers, schema harmonizer, DST handling)
+- `dbt build --target ci` on a small fixture sample (one day of trips plus 6 snapshots)
+- `sqlfluff` (optional)
+
+Also: pre-commit hooks, a Makefile, a uv- or pip-tools-locked environment, and a README with the architecture diagram, data dictionary, and a "how to reproduce" section.
+
+## 3. Alternative angles
+- **Rain Check (simpler, pure time series).** Forecast hourly or daily system ridership 1–7 days ahead from trips + Open-Meteo forecasts + holidays. Benchmark seasonal naive, SARIMAX/Prophet, and LightGBM, and score live. ~30 h. Less engineering, more classic forecasting.
+- **Bikes vs Trains (multimodal).** Join MTA hourly subway ridership (5wq4-mkjj) to bike departures near each station complex. Forecast both, and measure bike-demand spikes during subway disruptions or weather. ~45–50 h. Heavier, because MTA data is large and lags ~12 days.
+
+## 4. Milestone roadmap (~43 h)
+| # | Milestone | You'll learn | Hours |
+|---|---|---|---|
+| M1 | Repo skeleton, env, DuckDB; load 1 month of trips into `raw_trips`; profile it | Project structure, DuckDB `read_csv`, data profiling | 4 |
+| M2 | **Start the GBFS snapshotter** on GitHub Actions (every 10 min) -> Parquet/MotherDuck, plus a `pipeline_runs` log | API ingestion, cron, secrets, idempotent writes | 5 |
+| M3 | Backfill 12–24 months of trips (multi-part zips, JC optional); harmonize the legacy schema if you go before 2021 | Incremental loads, schema evolution, file hygiene | 5 |
+| M4 | dbt silver/gold: stg_*, dim_station (SCD2), fct_* with 30+ tests and source freshness | dbt modelling, tests, docs, lineage | 8 |
+| M5 | Weather + holiday ingestion, dim_date_hour (DST-safe), feature table | Time-zone handling, joins at the right grain | 4 |
+| M6 | Baselines + logistic/LightGBM, walk-forward backtest, reliability plots | Time-series CV, proper scoring rules, leakage control | 8 |
+| M7 | Live loop: hourly forecasts -> scoring job -> forecast_scores; anomaly checks | Production ML monitoring, MLOps basics | 4 |
+| M8 | Streamlit/Evidence dashboard, CI, README, short write-up/blog | Communication, deployment | 5 |
+
+## 5. Resume bullet templates (fill in real numbers only)
+- Built an automated ELT pipeline ingesting [N]M+ NYC bike-share trips and [N]M live station snapshots ([cadence]) into DuckDB/MotherDuck, orchestrated with GitHub Actions and modelled in dbt across bronze/silver/gold layers.
+- Implemented [N] dbt data-quality tests (uniqueness, referential integrity, capacity bounds, freshness, volume anomalies), catching [N] upstream issues such as [example].
+- Developed an hourly "station empty in 60 min" classifier (LightGBM) that improved Brier score by [X]% over a station-climatology baseline across [N] weeks of walk-forward and live evaluation.
+- Deployed a self-scoring forecast loop and public Streamlit dashboard tracking model vs. baseline accuracy, pipeline health, and [N] stations in near real time.
+- Handled schema evolution (2013–[year] trip formats), station-ID remapping across feed and trip data ([X]% match), and DST-safe time-series joins with hourly weather.
+
+## 6. Starter pointers (no code)
+- Trip index: https://s3.amazonaws.com/tripdata/ (an S3 XML listing; parse `<Key>`, `<LastModified>`, `<Size>`)
+- System data page: https://citibikenyc.com/system-data ; licence: https://citibikenyc.com/data-sharing-policy
+- GBFS: https://gbfs.citibikenyc.com/gbfs/2.3/gbfs.json
+- Open-Meteo: https://open-meteo.com/en/docs/historical-weather-api and https://open-meteo.com/en/docs ; NCEI: https://www.ncei.noaa.gov/access/services/data/v1 (dataset=daily-summaries, station USW00094728)
+- NYC Open Data SoQL: https://data.cityofnewyork.us/resource/ct66-47at.json?$limit=5
+- Tools: dbt-duckdb, DuckDB, MotherDuck, Streamlit, LightGBM, GitHub Actions schedule docs
+
+## 7. Gotchas (verified unless marked)
+1. **Schema change in Feb 2021.** Jan 2021 files use `tripduration, starttime, stoptime, start station id, ..., bikeid, usertype, birth year, gender`. From Feb 2021 the columns are `ride_id, rideable_type, started_at, ended_at, ..., member_casual`. Verified on the JC-202101 and JC-202102 files. The NYC files follow the same switch (well documented; NYC 2021 zip not opened). Legacy files have no ride_id, and modern files have no bikeid or demographics.
+2. **ride_id type drift.** It was a hex string in 2021 (e.g. `121DD7DD23CB1335`) and is numeric in Oct 2026 (parsed as BIGINT). Always cast to VARCHAR.
+3. **Station IDs.** Legacy files use integers (e.g. `164`); modern files use `6560.01`-style IDs; GBFS station_id is a UUID. Join on GBFS `short_name` = trip station_id: 2,356 of 2,370 Oct-2026 IDs matched. Some IDs carry 2 names within one month. Build `dim_station` as SCD2.
+4. **File packaging is messy.**
+   - Monthly zips hold multiple ~250 MB CSV parts.
+   - Yearly zips (2013–2023) contain nested folders plus `__MACOSX`/`.DS_Store` junk.
+   - JC names are inconsistent: `.csv.zip` vs `.zip`, a `citbike` typo in JC-202207, and a space in `JC-201708 citibike...`.
+   - Discover files from the index; never hard-code names.
+5. **Suspiciously small files (unverified).** 202604 is 164 MB and 202602 is 237 MB, against ~700 MB for April 2025. Check row counts after loading; they could be partial uploads or just better compression (202610 is 315 MB zipped for 5.09M rows).
+6. **Time zones and DST.** Trip timestamps are naive local NYC time. The fall-back hour shows up twice and the spring-forward hour is missing. GBFS `last_updated`/`last_reported` are UTC epoch seconds. Store UTC and derive local hour in one place (`dim_date_hour`). Open-Meteo returns local time when you pass `timezone=`. GitHub cron runs in UTC unless a timezone is set.
+7. **Dirty records.** In Oct 2026: 2,879 trips with a null start station, 14,317 with a null end station, and 923 longer than 24 h. There are no trips under 60 s; they look pre-filtered.
+8. **GBFS quirks.** Uninstalled stations report zeros with `last_reported = 86400`, so filter on is_installed/is_renting. Dedupe on (station_id, last_reported), because a station that hasn't reported repeats across snapshots.
+9. **Publication lags.** Trips: ~5–12 days after month end. Open-Meteo archive: ~2 days. NCEI daily: ~1 week. MTA hourly: ~12 days. For live features, use the Open-Meteo forecast endpoint, not the archive.
+10. **Open-Meteo grid snapping.** Coordinates snap to a model grid cell (the Central Park request returned 40.808, -74.020). Fine for city-wide weather; just note it.
+11. **GitHub Actions limits.** 5-minute minimum interval, possible delays or drops at busy times, and auto-disable after 60 days without repo activity. The gap monitor and a monthly commit (e.g. the monthly load commit or a README badge update) handle this.
+12. **Licence.** Don't publish raw snapshots or trips as a downloadable dataset; publish derived aggregates and analysis. Don't use the Citi Bike name or logo in a way that implies endorsement. Credit Open-Meteo (CC BY 4.0).
