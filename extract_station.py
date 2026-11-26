@@ -1,10 +1,20 @@
 from zoneinfo import ZoneInfo
 
+import os
 import duckdb
 import requests 
 from datetime import datetime, timezone
 import json 
-con = duckdb.connect("dockcast.duckdb")
+from dotenv import load_dotenv
+load_dotenv()
+
+con = duckdb.connect(
+    "md:dockcast_fr",
+    config={
+        "motherduck_token": os.environ["MOTHERDUCK_TOKEN"],
+        "storage_compatibility_version": "v1.5.6"
+    }
+)
 
 url = "https://gbfs.lyft.com/gbfs/2.3/bkn/en/station_status.json"
 response = requests.get(url)
@@ -19,7 +29,7 @@ con.execute("""
     CREATE SCHEMA IF NOT EXISTS bronze;
 
     CREATE TABLE IF NOT EXISTS bronze.raw_trips(
-        station_id VARCHAR,
+        station_id VARCHAR, 
         num_bikes_available INTEGER,
         num_ebikes_available INTEGER,
         num_docks_available INTEGER,
@@ -48,4 +58,5 @@ for station in stations:
     ])
 
 print( stations[0]["num_bikes_available"] )
+print("worked")
 con.close()

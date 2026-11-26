@@ -1,9 +1,21 @@
+
+import os
 import duckdb
 import requests 
 from datetime import datetime, timezone
 import json 
 from zoneinfo import ZoneInfo
-con = duckdb.connect("dockcast.duckdb")
+from dotenv import load_dotenv
+
+load_dotenv()
+
+con = duckdb.connect(
+    "md:dockcast_fr",
+    config={
+        "motherduck_token": os.environ["MOTHERDUCK_TOKEN"],
+        "storage_compatibility_version": "v1.5.6"
+    }
+)
 
 locations = [
     {"longitude": -74.05169461801283, "latitude": 40.75327580084569},
